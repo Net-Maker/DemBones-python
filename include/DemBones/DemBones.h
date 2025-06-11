@@ -219,7 +219,7 @@ public:
 					for (int rep=0; rep<nInitIters; rep++) {
 						computeTransFromLabel();
 						computeLabel_simple();
-						pruneBones(3);
+						pruneBones(int(nV/100));
 					}
 					cont=(nB<targetNB)&&(nB>prev);
 					if (nB==prev) std::cout << "nB == prev!!!" << std::endl;
