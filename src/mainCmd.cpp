@@ -38,16 +38,16 @@ public:
 	}
 
 	bool cbIterEnd() {
-		rsme_err=rmse();
-		msg(1, "RMSE = "<<rsme_err << "Other values:" << (rsme_err<prevErr*(1+weightEps)) << ((prevErr-rsme_err)<tolerance*prevErr) << "\n");
-		if ((rsme_err<prevErr*(1+weightEps))&&((prevErr-rsme_err)<tolerance*prevErr)) {
+		double err=rmse();
+		msg(1, "RMSE = "<<err << " | Error not degraded: " << (err<prevErr*(1+weightEps)) << " | Convergence rate below tolerance: " << ((prevErr-err)<tolerance*prevErr) << "\n");
+		if ((err<prevErr*(1+weightEps))&&((prevErr-err)<tolerance*prevErr)) {
 			np--;
 			if (np==0) {
 				msg(1, "    Convergence is reached!\n");
 				return true;
 			}
 		} else np=patience;
-		prevErr=rsme_err;
+		prevErr=err;
 		return false;
 	}
 

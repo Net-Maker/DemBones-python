@@ -215,11 +215,11 @@ public:
 				while (cont) {
 					cbInitSplitBegin();
 					int prev=nB;
-					split(targetNB, 3);
+					split(targetNB, int(nV/500));
 					for (int rep=0; rep<nInitIters; rep++) {
 						computeTransFromLabel();
 						computeLabel_simple();
-						pruneBones(int(nV/100));
+						pruneBones(int(nV/500));
 					}
 					cont=(nB<targetNB)&&(nB>prev);
 					if (nB==prev) std::cout << "nB == prev!!!" << std::endl;
@@ -257,7 +257,7 @@ public:
 	void computeTranformations() {
 		if (nTransIters==0) return;
 
-		// init();
+		init();
 		cbTranformationsBegin();
 
 		compute_vuT();
@@ -304,11 +304,10 @@ public:
 	void computeWeights() {
 		if (nWeightsIters==0) return;
 		
-		// init();
+		init();
 		cbWeightsBegin();
 		
 		compute_mTm();
-
 
 		aTb=MatrixX::Zero(nB, nV);
 		wSolver.init(nnz);
@@ -330,54 +329,12 @@ public:
 				compute_aTa(i, aTai);
 				aTai=(1-lockW(i))*(aTai/reg_scale+weightsSmooth*MatrixX::Identity(nB, nB))+lockW(i)*MatrixX::Identity(nB, nB);
 				VectorX aTbi=(1-lockW(i))*(aTb.col(i)/reg_scale+weightsSmooth*ws.col(i))+lockW(i)*w.col(i);
+
 				VectorX x=(1-lockW(i))*ws.col(i)+lockW(i)*w.col(i);
-				VectorX ErrorBone = ErrVtxBoneAll.row(i);
-				// Eigen::ArrayXi idx=Eigen::ArrayXi::LinSpaced(nB, 0, nB-1); 
-
-				// For global update use selected bones
-				Eigen::ArrayXi idx=keep_bones;
-				// idx._set(keep_bones); 
-				// std::cout << "Idx" << idx << std::endl;
-				int modified_nB = int(keep_bones.size());
-
-				std::sort(idx.data(), idx.data()+modified_nB, [&ErrorBone](int i1, int i2) { return ErrorBone(i1)<ErrorBone(i2); });
-			
-
-				// int nnzi=std::min(nnz, nB);
-				// std::cout << "Idx" << idx << std::endl;
-
-				int nnzi=std::min(nnz, modified_nB);
-				// std::cout << "nnzi" << nnzi << std::endl;
-				// std::cout << "x[0]" << x(idx(nnzi-1)) << std::endl;
-				// std::cout << "x[1]" << x(idx(nnzi-2)) << std::endl;
-				// std::cout << "x[2]" << x(idx(nnzi-3)) << std::endl;
-
-				while ((x(idx(nnzi-1))<weightEps)&&nnzi>1){ 
-					nnzi--;
-					// std::cout << "nnzi" << nnzi << std::endl;
-				};
-				// std::cout << "weightEps" << weightEps << std::endl;
-
-
-				// if(i==343){
-				// 	std::cout << "Original:";
-				// 	for (int i = 0; i < modified_nB; ++i){
-				// 	 	std::cout << keep_bones(i) << " ";
-				// 	}
-				// 	std::cout << std::endl;
-				// 	std::cout << "Idx:";
-				// 	for (int i = 0; i < modified_nB; ++i){
-				// 	 	std::cout << idx(i) << " ";
-				// 	}
-				// 	std::cout << std::endl;
-
-				// 	std::cout << "Weights:";
-				// 	for (int i = 0; i < modified_nB; ++i){
-				// 	 	std::cout << x(idx(i)) << " ";
-				// 	}
-				// 	std::cout << std::endl;
-				// }
-
+				Eigen::ArrayXi idx=Eigen::ArrayXi::LinSpaced(nB, 0, nB-1);
+				std::sort(idx.data(), idx.data()+nB, [&x](int i1, int i2) { return x(i1)>x(i2); });
+				int nnzi=std::min(nnz, nB);
+				while (x(idx(nnzi-1))<weightEps) nnzi--;
 
 				VectorX x0=w.col(i).toDense().cwiseMax(0.0);
 				x=indexing_vector(x0, idx.head(nnzi));
@@ -386,19 +343,9 @@ public:
 
 				wSolver.solve(indexing_row_col(aTai, idx.head(nnzi), idx.head(nnzi)), indexing_vector(aTbi, idx.head(nnzi)), x, true, true);
 
-				// Debug 0 case
-				// #pragma omp critical
-				// if(i%1000 == 0){
-				// 	for (int j=0; j<nnzi; j++)
-				// 		std::cout << "i " << i << " Bone:" << idx[j] << " Value:" << x(j) << std::endl;
-				// }
-
 				#pragma omp critical
 				for (int j=0; j<nnzi; j++)
 					if (x(j)!=0) trip.push_back(Triplet(idx[j], i, x(j)));
-
-
-
 			}
 
 			w.resize(nB, nV);
@@ -429,7 +376,6 @@ public:
 		for (_iter=0; _iter<nIters; _iter++) {
 			cbIterBegin();
 			computeTranformations();
-			compute_errorVtxBoneALL();
 			computeWeights();
 			if (cbIterEnd()) break;
 		}
@@ -898,7 +844,7 @@ public:
 		std::cout << "Spliting Clusters: Orignal:" << nB << std::endl; 
 		_Scalar avgErr=ce.sum()/nB;
 		for (int j=0; j<nB; j++){
-			std::cout << "Can split cluster: Number of vertices constrint:" << (s(j)>threshold*2) << " Avg Error constraint:" <<  (ce(j)>avgErr/100) << std::endl;
+			//std::cout << "Can split cluster: Number of vertices constrint:" << (s(j)>threshold*2) << " Avg Error constraint:" <<  (ce(j)>avgErr/100) << std::endl;
 			if ((countID<maxB)&&(s(j)>threshold*2)&&(ce(j)>avgErr/100)) {
 				int newLabel=countID++;
 				int i=seed(j);
