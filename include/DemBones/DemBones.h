@@ -198,7 +198,15 @@ public:
 	*/
 	void init() {
 		if (modelSize<0) modelSize=sqrt((u-(u.rowwise().sum()/nV).replicate(1, nV)).squaredNorm()/nV/nS);
-		if (laplacian.cols()!=nV) computeSmoothSolver();
+		if (laplacian.cols() != nV) {
+			if (fv.empty() || fv.size() == 0) {
+				// 点云数据：使用KNN
+				computeKNNSmoothSolver(8);  // 使用8个最近邻
+			} else {
+				// 网格数据：使用原来的方法
+				computeSmoothSolver();
+			}
+    }
 
 		if (((int)w.rows()!=nB)||((int)w.cols()!=nV)) { //No skinning weight
 			if (((int)m.rows()!=nF*4)||((int)m.cols()!=nB*4)) { //No transformation
@@ -341,11 +349,20 @@ public:
 				_Scalar s=x.sum();
 				if (s>_Scalar(0.1)) x/=s; else x=VectorX::Constant(nnzi, _Scalar(1)/nnzi);
 
-				wSolver.solve(indexing_row_col(aTai, idx.head(nnzi), idx.head(nnzi)), indexing_vector(aTbi, idx.head(nnzi)), x, true, true);
+				VectorX x_before = x;  // 保存求解前的权重
+				wSolver.solve(indexing_row_col(aTai, idx.head(nnzi), idx.head(nnzi)), 
+							  indexing_vector(aTbi, idx.head(nnzi)), x, true, true);
+				
 
 				#pragma omp critical
 				for (int j=0; j<nnzi; j++)
 					if (x(j)!=0) trip.push_back(Triplet(idx[j], i, x(j)));
+				
+				VectorX x_after = x;   // 求解后的权重
+
+				if ((x_before - x_after).norm() > 1e-10) {
+					std::cout << "顶点" << i << "权重已更新" << std::endl;
+				}
 			}
 
 			w.resize(nB, nV);
@@ -1015,12 +1032,16 @@ public:
 	/** Pre-compute aTb for weights update
 	*/
 	void compute_aTb() {
+		int compute_count=0;
 		#pragma omp parallel for
 		for (int i=0; i<nV; i++)
 			for (int j=0; j<nB; j++)
-				if ((aTb(j, i)==0)&&(ws(j, i)>weightEps))
+				if ((aTb(j, i)==0)&&(ws(j, i)>weightEps)){
+					compute_count++;
 					for (int k=0; k<nF; k++)
 						aTb(j, i)+=v.vec3(k, i).template cast<_Scalar>().dot(m.blk4(k, j).template topRows<3>()*u.vec3(subjectID(k), i).homogeneous());
+				}
+		std::cout << "compute_aTb: " << compute_count << "should_compute: " << nV*nB << std::endl;
 	}
 
 	//! Size of the model=RMS distance to centroid
@@ -1102,25 +1123,167 @@ public:
 		smoothSolver.compute(laplacian);
 	}
 
+	//! K-nearest neighbors for KNN-based smoothing
+	int knn_neighbors;
+
+	//! KNN adjacency matrix
+	SparseMatrix knn_laplacian;
+
+	//! LU factorization of KNN Laplacian  
+	Eigen::SparseLU<SparseMatrix> knn_smoothSolver;
+
+	/** @brief Compute KNN-based Laplacian and LU factorization
+		@param k Number of nearest neighbors for each vertex (default: 8)
+		@param sigma Gaussian kernel width parameter (default: auto-computed)
+	*/
+	void computeKNNSmoothSolver(int k = 8, _Scalar sigma = -1) {
+		knn_neighbors = k;
+		
+		// 1. 计算所有顶点对的距离 (使用第一个subject的rest pose)
+		std::vector<std::vector<std::pair<_Scalar, int>>> distances(nV);
+		
+		#pragma omp parallel for
+		for (int i = 0; i < nV; i++) {
+			distances[i].reserve(nV);
+			for (int j = 0; j < nV; j++) {
+				if (i != j) {
+					_Scalar dist = (u.vec3(0, i) - u.vec3(0, j)).norm();
+					distances[i].push_back(std::make_pair(dist, j));
+				}
+			}
+			// 按距离排序，保留最近的k个邻居
+			std::sort(distances[i].begin(), distances[i].end());
+			if (distances[i].size() > k) {
+				distances[i].resize(k);
+			}
+		}
+		
+		// 2. 自动计算sigma (如果没有指定的话)
+		if (sigma < 0) {
+			_Scalar avg_dist = 0;
+			int count = 0;
+			for (int i = 0; i < nV; i++) {
+				for (auto& pair : distances[i]) {
+					avg_dist += pair.first;
+					count++;
+				}
+			}
+			sigma = avg_dist / count;  // 使用平均距离作为sigma
+			std::cout << "自动计算的sigma: " << sigma << std::endl;
+		}
+		
+		// 3. 构建KNN拉普拉斯矩阵
+		std::vector<Triplet, Eigen::aligned_allocator<Triplet>> triplet;
+		VectorX row_sum = VectorX::Zero(nV);
+		
+		#pragma omp parallel for
+		for (int i = 0; i < nV; i++) {
+			for (auto& pair : distances[i]) {
+				_Scalar dist = pair.first;
+				int j = pair.second;
+				
+				// 高斯核权重: exp(-dist²/(2*sigma²))
+				_Scalar weight = std::exp(-dist * dist / (2 * sigma * sigma));
+				
+				#pragma omp critical
+				{
+					triplet.push_back(Triplet(i, j, -weight));  // 非对角元素为负
+					triplet.push_back(Triplet(j, i, -weight));  // 确保对称性
+				}
+				
+				#pragma omp atomic
+				row_sum(i) += weight;
+				#pragma omp atomic
+				row_sum(j) += weight;
+			}
+		}
+		
+		// 4. 添加对角元素 (使得每行和为0)
+		for (int i = 0; i < nV; i++) {
+			triplet.push_back(Triplet(i, i, row_sum(i)));
+		}
+		
+		// 5. 构建稀疏矩阵
+		knn_laplacian.resize(nV, nV);
+		knn_laplacian.setFromTriplets(triplet.begin(), triplet.end());
+		
+		// 6. 归一化每一行 (可选)
+		for (int i = 0; i < nV; i++) {
+			if (row_sum(i) > 1e-10) {
+				knn_laplacian.row(i) /= row_sum(i);
+			}
+		}
+		
+		// 7. 添加身份矩阵确保可逆性
+		knn_laplacian = weightsSmoothStep * knn_laplacian + 
+						SparseMatrix((VectorX::Ones(nV)).asDiagonal());
+		
+		// 8. 计算LU分解
+		knn_smoothSolver.compute(knn_laplacian);
+		
+		if (knn_smoothSolver.info() != Eigen::Success) {
+			std::cout << "警告: KNN拉普拉斯矩阵LU分解失败!" << std::endl;
+		} else {
+			std::cout << "KNN平滑求解器已初始化，k=" << k << ", sigma=" << sigma << std::endl;
+		}
+	}
+
+	/** @brief KNN-based weight smoothing
+	*/
+	void compute_ws_knn() {
+		ws = w.transpose();
+		
+		// 使用KNN平滑求解器
+		#pragma omp parallel for
+		for (int j = 0; j < nB; j++) {
+			if (knn_smoothSolver.info() == Eigen::Success) {
+				ws.col(j) = knn_smoothSolver.solve(ws.col(j));
+			}
+		}
+		
+		ws.transposeInPlace();
+
+		// 后处理：确保非负性和归一化
+		#pragma omp parallel for
+		for (int i = 0; i < nV; i++) {
+			ws.col(i) = ws.col(i).cwiseMax(0.0);
+			_Scalar si = ws.col(i).sum();
+			if (si < _Scalar(0.1)) {
+				ws.col(i) = VectorX::Constant(nB, _Scalar(1) / nB);
+			} else {
+				ws.col(i) /= si;
+			}
+		}
+	}
+
+
 	//! Smoothed skinning weights
 	MatrixX ws;
 
 	/** Implicit skinning weights Laplacian smoothing
 	*/
 	void compute_ws() {
-		ws=w.transpose();
-		// I deleted this line for gaussians
-		// #pragma omp parallel for
-		// for (int j=0; j<nB; j++) ws.col(j)=smoothSolver.solve(ws.col(j));
-		ws.transposeInPlace();
+    if (fv.empty() || fv.size() == 0) {
+        // 点云数据：使用KNN平滑
+        compute_ws_knn();
+    } else {
+        // 网格数据：使用原来的平滑方法
+        ws = w.transpose();
+        #pragma omp parallel for
+        for (int j = 0; j < nB; j++) {
+            ws.col(j) = smoothSolver.solve(ws.col(j));
+        }
+        ws.transposeInPlace();
 
-		#pragma omp parallel for
-		for (int i=0; i<nV; i++) {
-			ws.col(i)=ws.col(i).cwiseMax(0.0);
-			_Scalar si=ws.col(i).sum();
-			if (si<_Scalar(0.1)) ws.col(i)=VectorX::Constant(nB, _Scalar(1)/nB); else ws.col(i)/=si;
-		}
-	}
+        #pragma omp parallel for
+        for (int i = 0; i < nV; i++) {
+            ws.col(i) = ws.col(i).cwiseMax(0.0);
+            _Scalar si = ws.col(i).sum();
+            if (si < _Scalar(0.1)) ws.col(i) = VectorX::Constant(nB, _Scalar(1)/nB); 
+            else ws.col(i) /= si;
+        }
+    }
+}
 
 	//! Per-vertex weights solver
 	ConvexLS<_Scalar> wSolver;

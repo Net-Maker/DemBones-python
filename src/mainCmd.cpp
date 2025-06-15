@@ -23,7 +23,7 @@ class MyDemBones: public DemBonesExt<double, float> { // _Scalar = double, _Anim
 public:
 	double tolerance;
 	int patience;
-	double rsme_err;
+	double rmse_err;
 
 	MyDemBones(): tolerance(1e-3), patience(3) { nIters=100; }
 
@@ -38,16 +38,16 @@ public:
 	}
 
 	bool cbIterEnd() {
-		double err=rmse();
-		msg(1, "RMSE = "<<err << " | Error not degraded: " << (err<prevErr*(1+weightEps)) << " | Convergence rate below tolerance: " << ((prevErr-err)<tolerance*prevErr) << "\n");
-		if ((err<prevErr*(1+weightEps))&&((prevErr-err)<tolerance*prevErr)) {
+		rmse_err=rmse();
+		msg(1, "RMSE = "<<rmse_err << " | Error not degraded: " << (rmse_err<prevErr*(1+weightEps)) << " | Convergence rate below tolerance: " << ((prevErr-rmse_err)<tolerance*prevErr) << "\n");
+		if ((rmse_err<prevErr*(1+weightEps))&&((prevErr-rmse_err)<tolerance*prevErr)) {
 			np--;
 			if (np==0) {
 				msg(1, "    Convergence is reached!\n");
 				return true;
 			}
 		} else np=patience;
-		prevErr=err;
+		prevErr=rmse_err;
 		return false;
 	}
 
@@ -142,7 +142,7 @@ public:
 		compute();
 
 		if (!writeFBX(outFile) and outFile!="") return pybind11::make_tuple();
-		return pybind11::make_tuple(this->w,this->m,this->rsme_err);
+		return pybind11::make_tuple(this->w,this->m,this->rmse_err);
 	}
 
 
