@@ -111,6 +111,7 @@ public:
 			nTransIters(5),	transAffine(_Scalar(10)), transAffineNorm(_Scalar(4)),
 			nWeightsIters(3), nnz(8), weightsSmooth(_Scalar(1e-4)), weightsSmoothStep(_Scalar(1)),
 			weightEps(_Scalar(1e-15)),
+			knn_graph_computed(false),  // 初始化缓存标志
 			iter(_iter), iterTransformations(_iterTransformations), iterWeights(_iterWeights) {
 		clear();
 	}
@@ -184,6 +185,10 @@ public:
 		fv.resize(0);
 		modelSize=-1;
 		laplacian.resize(0, 0);
+		
+		// 清除KNN缓存
+		cached_knn_graph.clear();
+		knn_graph_computed = false;
 	}
 
 	/** @brief Initialize missing skinning weights and/or bone transformations
@@ -206,7 +211,7 @@ public:
 				// 网格数据：使用原来的方法
 				computeSmoothSolver();
 			}
-    }
+    	}
 
 		if (((int)w.rows()!=nB)||((int)w.cols()!=nV)) { //No skinning weight
 			if (((int)m.rows()!=nF*4)||((int)m.cols()!=nB*4)) { //No transformation
@@ -226,7 +231,7 @@ public:
 					split(targetNB, int(nV/500));
 					for (int rep=0; rep<nInitIters; rep++) {
 						computeTransFromLabel();
-						computeLabel_simple();
+						computeLabel();
 						pruneBones(int(nV/500));
 					}
 					cont=(nB<targetNB)&&(nB>prev);
@@ -349,7 +354,6 @@ public:
 				_Scalar s=x.sum();
 				if (s>_Scalar(0.1)) x/=s; else x=VectorX::Constant(nnzi, _Scalar(1)/nnzi);
 
-				VectorX x_before = x;  // 保存求解前的权重
 				wSolver.solve(indexing_row_col(aTai, idx.head(nnzi), idx.head(nnzi)), 
 							  indexing_vector(aTbi, idx.head(nnzi)), x, true, true);
 				
@@ -358,11 +362,6 @@ public:
 				for (int j=0; j<nnzi; j++)
 					if (x(j)!=0) trip.push_back(Triplet(idx[j], i, x(j)));
 				
-				VectorX x_after = x;   // 求解后的权重
-
-				if ((x_before - x_after).norm() > 1e-10) {
-					std::cout << "顶点" << i << "权重已更新" << std::endl;
-				}
 			}
 
 			w.resize(nB, nV);
@@ -697,7 +696,13 @@ public:
 		std::priority_queue<Triplet, std::vector<Triplet, Eigen::aligned_allocator<Triplet>>, TripletLess> heap;
 		for (int j=0; j<nB; j++) if (seed(j)!=-1) heap.push(Triplet(j, seed(j), ei(seed(j))));
 
-		if (laplacian.cols()!=nV) computeSmoothSolver();
+		if (laplacian.cols() != nV) {
+			if (fv.empty() || fv.size() == 0) {
+				computeKNNSmoothSolver(8); 
+			} else {
+				computeSmoothSolver();
+			}
+    	}
 
 		std::vector<bool> dirty(nV, true);
 		while (!heap.empty()) {
@@ -709,7 +714,7 @@ public:
 				label(i)=j;
 				ei(i)=top.value();
 				dirty[i]=false;
-				for (typename SparseMatrix::InnerIterator it(laplacian, i); it; ++it) {
+				for (typename SparseMatrix::InnerIterator it(knn_laplacian, i); it; ++it) {
 					int i2=(int)it.row();
 					if (dirty[i2]) {
 						double tmp=(label(i2)==j)?ei(i2):errorVtxBone(i2, j);
@@ -900,7 +905,7 @@ public:
 
 		nB=countID;
 		m.conservativeResize(nF*4, nB*4);
-		computeLabel_simple();
+		computeLabel();
 	}
 
 	/** Initialize skinning weights with rigid bind to the best bone
@@ -918,7 +923,7 @@ public:
 				}
 			}
 		}
-		computeLabel_simple();
+		computeLabel();
 		labelToWeights();
 	}
 
@@ -1032,16 +1037,16 @@ public:
 	/** Pre-compute aTb for weights update
 	*/
 	void compute_aTb() {
-		int compute_count=0;
+		// int compute_count=0;
 		#pragma omp parallel for
 		for (int i=0; i<nV; i++)
 			for (int j=0; j<nB; j++)
 				if ((aTb(j, i)==0)&&(ws(j, i)>weightEps)){
-					compute_count++;
+					// compute_count++;
 					for (int k=0; k<nF; k++)
 						aTb(j, i)+=v.vec3(k, i).template cast<_Scalar>().dot(m.blk4(k, j).template topRows<3>()*u.vec3(subjectID(k), i).homogeneous());
 				}
-		std::cout << "compute_aTb: " << compute_count << "should_compute: " << nV*nB << std::endl;
+		// std::cout << "compute_aTb: " << compute_count << "should_compute: " << nV*nB << std::endl;
 	}
 
 	//! Size of the model=RMS distance to centroid
@@ -1126,79 +1131,104 @@ public:
 	//! K-nearest neighbors for KNN-based smoothing
 	int knn_neighbors;
 
+	//! 缓存的KNN邻接关系
+	std::vector<std::vector<std::pair<_Scalar, int>>> cached_knn_graph;
+	bool knn_graph_computed;
+
 	//! KNN adjacency matrix
 	SparseMatrix knn_laplacian;
 
 	//! LU factorization of KNN Laplacian  
 	Eigen::SparseLU<SparseMatrix> knn_smoothSolver;
 
-	/** @brief Compute KNN-based Laplacian and LU factorization
-		@param k Number of nearest neighbors for each vertex (default: 8)
-		@param sigma Gaussian kernel width parameter (default: auto-computed)
+	/** @brief 计算并缓存KNN邻接关系
+		@param k 每个顶点的最近邻数量 (默认: 8)
 	*/
-	void computeKNNSmoothSolver(int k = 8, _Scalar sigma = -1) {
-		knn_neighbors = k;
+	void computeKNNGraph(int k = 8) {
+		if (knn_graph_computed && knn_neighbors == k) {
+			// 如果已经计算过相同参数的KNN图，直接返回
+			return;
+		}
 		
-		// 1. 计算所有顶点对的距离 (使用第一个subject的rest pose)
-		std::vector<std::vector<std::pair<_Scalar, int>>> distances(nV);
+		knn_neighbors = k;
+		cached_knn_graph.resize(nV);
+		
+		std::cout << "init KNN, k=" << k << std::endl;
 		
 		#pragma omp parallel for
 		for (int i = 0; i < nV; i++) {
-			distances[i].reserve(nV);
+			std::vector<std::pair<_Scalar, int>> distances;
+			distances.reserve(nV - 1);
+			
+			// 计算到所有其他顶点的距离
 			for (int j = 0; j < nV; j++) {
 				if (i != j) {
 					_Scalar dist = (u.vec3(0, i) - u.vec3(0, j)).norm();
-					distances[i].push_back(std::make_pair(dist, j));
+					distances.push_back(std::make_pair(dist, j));
 				}
 			}
-			// 按距离排序，保留最近的k个邻居
-			std::sort(distances[i].begin(), distances[i].end());
-			if (distances[i].size() > k) {
-				distances[i].resize(k);
+			
+			// 部分排序，只保留最小的k个
+			if (distances.size() > k) {
+				std::nth_element(distances.begin(), distances.begin() + k, distances.end());
+				distances.resize(k);
 			}
+			
+			cached_knn_graph[i] = std::move(distances);
 		}
 		
-		// 2. 自动计算sigma (如果没有指定的话)
+		knn_graph_computed = true;
+		std::cout << "init KNN, k=" << k << " done" << std::endl;
+	}
+
+	/** @brief 基于缓存的KNN图构建拉普拉斯矩阵和LU分解
+		@param k 每个顶点的最近邻数量 (默认: 8)
+		@param sigma 高斯核宽度参数 (默认: 自动计算)
+	*/
+	void computeKNNSmoothSolver(int k = 8, _Scalar sigma = -1) {
+		// 1. 确保KNN图已计算并缓存
+		computeKNNGraph(k);
+		
+		// 2. 自动计算sigma (如果需要)
 		if (sigma < 0) {
-			_Scalar avg_dist = 0;
-			int count = 0;
+			_Scalar total_distance = 0;
+			int edge_count = 0;
+			
 			for (int i = 0; i < nV; i++) {
-				for (auto& pair : distances[i]) {
-					avg_dist += pair.first;
-					count++;
+				for (const auto& pair : cached_knn_graph[i]) {
+					total_distance += pair.first;
+					edge_count++;
 				}
 			}
-			sigma = avg_dist / count;  // 使用平均距离作为sigma
-			std::cout << "自动计算的sigma: " << sigma << std::endl;
+			
+			sigma = total_distance / edge_count;
+			// std::cout << "自动计算的sigma: " << sigma << std::endl;
 		}
 		
-		// 3. 构建KNN拉普拉斯矩阵
+		// 3. 基于缓存的KNN图构建拉普拉斯矩阵
 		std::vector<Triplet, Eigen::aligned_allocator<Triplet>> triplet;
+		triplet.reserve(nV * k * 2 + nV);  // 预分配空间
+		
 		VectorX row_sum = VectorX::Zero(nV);
 		
-		#pragma omp parallel for
 		for (int i = 0; i < nV; i++) {
-			for (auto& pair : distances[i]) {
+			for (const auto& pair : cached_knn_graph[i]) {
 				_Scalar dist = pair.first;
 				int j = pair.second;
 				
-				// 高斯核权重: exp(-dist²/(2*sigma²))
+				// 高斯核权重
 				_Scalar weight = std::exp(-dist * dist / (2 * sigma * sigma));
 				
-				#pragma omp critical
-				{
-					triplet.push_back(Triplet(i, j, -weight));  // 非对角元素为负
-					triplet.push_back(Triplet(j, i, -weight));  // 确保对称性
-				}
+				// 添加边 (i, j)，确保对称性
+				triplet.push_back(Triplet(i, j, -weight));
+				triplet.push_back(Triplet(j, i, -weight));
 				
-				#pragma omp atomic
 				row_sum(i) += weight;
-				#pragma omp atomic
 				row_sum(j) += weight;
 			}
 		}
 		
-		// 4. 添加对角元素 (使得每行和为0)
+		// 4. 添加对角元素
 		for (int i = 0; i < nV; i++) {
 			triplet.push_back(Triplet(i, i, row_sum(i)));
 		}
@@ -1207,24 +1237,23 @@ public:
 		knn_laplacian.resize(nV, nV);
 		knn_laplacian.setFromTriplets(triplet.begin(), triplet.end());
 		
-		// 6. 归一化每一行 (可选)
+		// 6. 行归一化
 		for (int i = 0; i < nV; i++) {
 			if (row_sum(i) > 1e-10) {
 				knn_laplacian.row(i) /= row_sum(i);
 			}
 		}
 		
-		// 7. 添加身份矩阵确保可逆性
+		// 7. 添加身份矩阵并计算LU分解
 		knn_laplacian = weightsSmoothStep * knn_laplacian + 
 						SparseMatrix((VectorX::Ones(nV)).asDiagonal());
 		
-		// 8. 计算LU分解
 		knn_smoothSolver.compute(knn_laplacian);
 		
 		if (knn_smoothSolver.info() != Eigen::Success) {
 			std::cout << "警告: KNN拉普拉斯矩阵LU分解失败!" << std::endl;
 		} else {
-			std::cout << "KNN平滑求解器已初始化，k=" << k << ", sigma=" << sigma << std::endl;
+			std::cout << "KNN solved, k=" << k << ", sigma=" << sigma;
 		}
 	}
 
