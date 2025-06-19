@@ -1211,6 +1211,7 @@ public:
 		
 		VectorX row_sum = VectorX::Zero(nV);
 		
+		
 		for (int i = 0; i < nV; i++) {
 			for (const auto& pair : cached_knn_graph[i]) {
 				_Scalar dist = pair.first;
